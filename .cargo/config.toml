@@ -1,0 +1,25 @@
+[build]
+# Work around Windows file locking issues by keeping build artifacts out of the project folder.
+# This also reduces the chance of AV/indexers locking files under faucet\target.
+target-dir = "D:/kaspa-cargo-target/faucet"
+jobs = 1
+
+[term]
+verbose = false
+
+[profile.release]
+# Slightly faster local builds while iterating
+debug = 0
+
+[net]
+# Makes network operations more reliable on flaky connections
+retry = 2
+
+[unstable]
+# Limit parallelism (helps avoid os error 32 on Windows)
+build-std = []
+
+[env]
+# Also cap Rust build parallelism
+CARGO_BUILD_JOBS = "1"
+RUSTFLAGS = ""

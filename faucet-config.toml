@@ -1,0 +1,5 @@
+kaspad_url = "127.0.0.1:16110"
+port = 3050
+faucet_private_key = ""
+amount_per_claim = 10052000
+claim_interval_seconds = 3600
