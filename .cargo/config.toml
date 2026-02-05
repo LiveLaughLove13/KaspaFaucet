@@ -1,7 +1,8 @@
 [build]
 # Work around Windows file locking issues by keeping build artifacts out of the project folder.
 # This also reduces the chance of AV/indexers locking files under faucet\target.
-target-dir = "D:/kaspa-cargo-target/faucet"
+# Using relative path that works cross-platform (Windows, Linux, macOS)
+target-dir = "../kaspa-cargo-target/faucet"
 jobs = 1
 
 [term]
