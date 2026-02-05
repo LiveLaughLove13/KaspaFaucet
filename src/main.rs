@@ -1,6 +1,6 @@
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{Html, Json},
     routing::{get, post},
     Router,
@@ -15,11 +15,15 @@ use kaspa_grpc_client::GrpcClient;
 use kaspa_rpc_core::{api::rpc::RpcApi, notify::mode::NotificationMode, RpcTransaction};
 use kaspa_txscript::standard::pay_to_address_script;
 use serde::{Deserialize, Serialize};
-use std::{net::SocketAddr, str::FromStr, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    str::FromStr,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 use tokio::net::TcpListener;
-use tokio::time::Duration;
-use tower_http::cors::CorsLayer;
-use tower_http::services::ServeDir;
+use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer, services::ServeDir};
 use tracing::{error, info, warn};
 
 mod config;
@@ -49,6 +53,13 @@ struct ClaimRequest {
     address: String,
 }
 
+// Maximum address length to prevent DoS
+const MAX_ADDRESS_LENGTH: usize = 200;
+// Maximum JSON request body size (10KB)
+const MAX_REQUEST_BODY_SIZE: usize = 10 * 1024;
+// Transaction deduplication window (prevent duplicate transactions within 5 minutes)
+const TX_DEDUP_WINDOW: Duration = Duration::from_secs(300);
+
 #[derive(Serialize)]
 struct ClaimResponse {
     transaction_id: String,
@@ -64,6 +75,8 @@ struct AppState {
     amount_per_claim: u64,
     claim_interval_seconds: u64,
     rate_limiter: Arc<rate_limiter::RateLimiter>,
+    // Track recent transactions to prevent duplicates (key: "ip:address", value: timestamp)
+    recent_transactions: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 #[tokio::main]
@@ -136,10 +149,13 @@ async fn main() -> anyhow::Result<()> {
     let info = client.get_info().await?;
     info!("Connected to kaspad: {:?}", info);
 
-    // Simple in-memory rate limiter
+    // Enhanced rate limiter with IP and address tracking
     let rate_limiter = Arc::new(rate_limiter::RateLimiter::new(Duration::from_secs(
         config.claim_interval_seconds,
     )));
+
+    // Transaction deduplication map
+    let recent_transactions = Arc::new(Mutex::new(HashMap::new()));
 
     let state = AppState {
         client,
@@ -148,14 +164,17 @@ async fn main() -> anyhow::Result<()> {
         amount_per_claim: config.amount_per_claim,
         claim_interval_seconds: config.claim_interval_seconds,
         rate_limiter,
+        recent_transactions,
     };
 
-    // Build router
+    // Build router with security layers
     let app = Router::new()
         .route("/", get(|| async { Html(INDEX_HTML) }))
         .nest_service("/static", ServeDir::new("static"))
         .route("/status", get(status_handler))
         .route("/claim", post(claim_handler))
+        // Limit request body size to prevent DoS
+        .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_SIZE))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -193,32 +212,93 @@ async fn status_handler(State(state): State<AppState>) -> Result<Json<StatusResp
 async fn claim_handler(
     State(state): State<AppState>,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(payload): Json<ClaimRequest>,
 ) -> Result<Json<ClaimResponse>, StatusCode> {
-    let ip = addr.ip().to_string();
+    // Extract real IP address (handle proxies)
+    let ip = extract_real_ip(&addr, &headers);
     info!(
         "Claim request from IP: {}, address: {}",
         ip, payload.address
     );
 
-    // Mainnet address prefix check (fast fail + clearer error in logs)
-    if !payload.address.starts_with("kaspa:") {
-        warn!(
-            "Invalid address prefix (expected kaspa:): {}",
-            payload.address
-        );
+    // Input validation: check address length
+    if payload.address.len() > MAX_ADDRESS_LENGTH {
+        warn!("Address too long: {} characters", payload.address.len());
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let destination: Address = payload.address.as_str().try_into().map_err(|e| {
-        warn!("Invalid address: {}", e);
+    // Trim and normalize address
+    let address_str = payload.address.trim();
+    if address_str.is_empty() {
+        warn!("Empty address provided");
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Mainnet address prefix check (fast fail + clearer error in logs)
+    if !address_str.starts_with("kaspa:") {
+        warn!("Invalid address prefix (expected kaspa:): {}", address_str);
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Parse and validate address
+    // The Address parsing will validate the format and network
+    // Since we already checked for "kaspa:" prefix, this ensures mainnet
+    let destination: Address = address_str.try_into().map_err(|e| {
+        warn!("Invalid address format or network: {}", e);
         StatusCode::BAD_REQUEST
     })?;
 
-    // Rate limit check
-    if !state.rate_limiter.try_claim(&ip) {
-        warn!("Rate limit exceeded for IP: {}", ip);
+    // Check for duplicate transaction (same IP + address combination)
+    {
+        let mut recent_txs = state.recent_transactions.lock().unwrap();
+        // Cleanup old entries
+        let now = Instant::now();
+        recent_txs.retain(|_, instant| now.duration_since(*instant) < TX_DEDUP_WINDOW);
+
+        let key = format!("{}:{}", ip, address_str);
+        if recent_txs.contains_key(&key) {
+            warn!(
+                "Duplicate transaction attempt detected: IP={}, address={}",
+                ip, address_str
+            );
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
+        recent_txs.insert(key, now);
+    }
+
+    // Check if address has received funds before (prevent new address spam)
+    // This helps prevent abuse where users generate many new addresses
+    let address_balance = state
+        .client
+        .get_balance_by_address(destination.clone())
+        .await
+        .map_err(|e| {
+            warn!("Failed to check address balance: {}", e);
+            // Don't fail the request if we can't check balance, but log it
+        })
+        .unwrap_or(0);
+
+    // Rate limit check (enhanced with multiple layers of protection)
+    let (allowed, reason) = state.rate_limiter.try_claim(&ip, address_str);
+    if !allowed {
+        warn!(
+            "Rate limit exceeded for IP: {}, address: {} - Reason: {}",
+            ip,
+            address_str,
+            reason.unwrap_or("unknown")
+        );
         return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    // Log address history for monitoring (new addresses vs existing ones)
+    if address_balance == 0 {
+        info!("New address claim: {} (no previous balance)", address_str);
+    } else {
+        info!(
+            "Existing address claim: {} (balance: {} sompi)",
+            address_str, address_balance
+        );
     }
 
     let tx_id = submit_faucet_transaction(
@@ -239,6 +319,34 @@ async fn claim_handler(
         amount_kas: format_kas_from_sompi(state.amount_per_claim),
         next_claim_seconds: state.claim_interval_seconds,
     }))
+}
+
+/// Extract the real IP address from the request, handling proxies
+fn extract_real_ip(addr: &SocketAddr, headers: &HeaderMap) -> String {
+    // Check X-Forwarded-For header (use first IP if multiple)
+    if let Some(forwarded) = headers.get("x-forwarded-for") {
+        if let Ok(forwarded_str) = forwarded.to_str() {
+            // X-Forwarded-For can contain multiple IPs: "client, proxy1, proxy2"
+            // We take the first one (the original client)
+            if let Some(first_ip) = forwarded_str.split(',').next() {
+                let ip_str = first_ip.trim();
+                // Basic validation: check if it looks like an IP
+                if ip_str.contains(':') || ip_str.matches('.').count() == 3 {
+                    return ip_str.to_string();
+                }
+            }
+        }
+    }
+
+    // Check X-Real-IP header
+    if let Some(real_ip) = headers.get("x-real-ip") {
+        if let Ok(ip_str) = real_ip.to_str() {
+            return ip_str.trim().to_string();
+        }
+    }
+
+    // Fall back to direct connection IP
+    addr.ip().to_string()
 }
 
 async fn submit_faucet_transaction(

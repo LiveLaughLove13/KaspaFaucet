@@ -189,8 +189,15 @@ async fn claim_handler(
         StatusCode::BAD_REQUEST
     })?;
 
-    if !state.rate_limiter.try_claim(&ip) {
-        warn!("Rate limit exceeded for IP: {}", ip);
+    let address_str = payload.address.trim();
+    let (allowed, reason) = state.rate_limiter.try_claim(&ip, address_str);
+    if !allowed {
+        warn!(
+            "Rate limit exceeded for IP: {}, address: {} - Reason: {}",
+            ip,
+            address_str,
+            reason.unwrap_or("unknown")
+        );
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 
