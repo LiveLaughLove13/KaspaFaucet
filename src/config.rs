@@ -17,7 +17,7 @@ impl Default for Config {
             port: 3010,
             faucet_private_key: String::new(),
             amount_per_claim: 100_000_000, // 0.001 KAS in sompis
-            claim_interval_seconds: 3600, // 1 hour
+            claim_interval_seconds: 3600,  // 1 hour
         }
     }
 }
@@ -29,7 +29,10 @@ impl Config {
             let default = Config::default();
             let toml = toml::to_string_pretty(&default)?;
             fs::write(config_path, toml)?;
-            anyhow::bail!("Created default config at {}. Please edit and restart.", config_path);
+            anyhow::bail!(
+                "Created default config at {}. Please edit and restart.",
+                config_path
+            );
         }
 
         let contents = fs::read_to_string(config_path)?;

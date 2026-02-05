@@ -29,12 +29,12 @@ use config::Config;
 
 const INDEX_HTML: &str = include_str!("../static/index.html");
 
- fn format_kas_from_sompi(amount_sompi: u64) -> String {
-     const SOMPI_PER_KAS: u64 = 100_000_000;
-     let whole = amount_sompi / SOMPI_PER_KAS;
-     let frac = amount_sompi % SOMPI_PER_KAS;
-     format!("{}.{:08}", whole, frac)
- }
+fn format_kas_from_sompi(amount_sompi: u64) -> String {
+    const SOMPI_PER_KAS: u64 = 100_000_000;
+    let whole = amount_sompi / SOMPI_PER_KAS;
+    let frac = amount_sompi % SOMPI_PER_KAS;
+    format!("{}.{:08}", whole, frac)
+}
 
 #[derive(Serialize)]
 struct StatusResponse {
@@ -86,7 +86,11 @@ async fn main() -> anyhow::Result<()> {
 
     let public_key = secp256k1::PublicKey::from_secret_key_global(&faucet_private_key);
     let (x_only_public_key, _) = public_key.x_only_public_key();
-    let faucet_address = Address::new(Prefix::Mainnet, Version::PubKey, &x_only_public_key.serialize());
+    let faucet_address = Address::new(
+        Prefix::Mainnet,
+        Version::PubKey,
+        &x_only_public_key.serialize(),
+    );
 
     // Connect to kaspad
     let grpc_url = if config.kaspad_url.starts_with("grpc://") {
@@ -119,7 +123,10 @@ async fn main() -> anyhow::Result<()> {
             c
         }
         Err(e) => {
-            warn!("connect_with_args failed, falling back to connect(): {:?}", e);
+            warn!(
+                "connect_with_args failed, falling back to connect(): {:?}",
+                e
+            );
             let c = GrpcClient::connect(grpc_url).await?;
             c.start(None).await;
             c
@@ -165,9 +172,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn status_handler(
-    State(state): State<AppState>,
-) -> Result<Json<StatusResponse>, StatusCode> {
+async fn status_handler(State(state): State<AppState>) -> Result<Json<StatusResponse>, StatusCode> {
     let balance = state
         .client
         .get_balance_by_address(state.faucet_address.clone())
@@ -191,11 +196,17 @@ async fn claim_handler(
     Json(payload): Json<ClaimRequest>,
 ) -> Result<Json<ClaimResponse>, StatusCode> {
     let ip = addr.ip().to_string();
-    info!("Claim request from IP: {}, address: {}", ip, payload.address);
+    info!(
+        "Claim request from IP: {}, address: {}",
+        ip, payload.address
+    );
 
     // Mainnet address prefix check (fast fail + clearer error in logs)
     if !payload.address.starts_with("kaspa:") {
-        warn!("Invalid address prefix (expected kaspa:): {}", payload.address);
+        warn!(
+            "Invalid address prefix (expected kaspa:): {}",
+            payload.address
+        );
         return Err(StatusCode::BAD_REQUEST);
     }
 
@@ -296,15 +307,25 @@ async fn submit_faucet_transaction(
         .collect::<Vec<_>>();
 
     let mut outputs = Vec::new();
-    outputs.push(TransactionOutput::new(amount, pay_to_address_script(destination)));
+    outputs.push(TransactionOutput::new(
+        amount,
+        pay_to_address_script(destination),
+    ));
     if change > 0 {
-        outputs.push(TransactionOutput::new(change, pay_to_address_script(faucet_address)));
+        outputs.push(TransactionOutput::new(
+            change,
+            pay_to_address_script(faucet_address),
+        ));
     }
 
     let tx = Transaction::new(0, inputs, outputs, 0, SUBNETWORK_ID_NATIVE, 0, vec![]);
-    let entries = selected.into_iter().map(|e| UtxoEntry::from(e.utxo_entry)).collect::<Vec<_>>();
+    let entries = selected
+        .into_iter()
+        .map(|e| UtxoEntry::from(e.utxo_entry))
+        .collect::<Vec<_>>();
     let signable_tx = SignableTransaction::with_entries(tx, entries);
-    let signed_tx = sign_with_multiple_v2(signable_tx, std::slice::from_ref(private_key)).fully_signed()?;
+    let signed_tx =
+        sign_with_multiple_v2(signable_tx, std::slice::from_ref(private_key)).fully_signed()?;
 
     let rpc_transaction: RpcTransaction = signed_tx.tx.as_ref().into();
     let tx_id = client.submit_transaction(rpc_transaction, false).await?;
