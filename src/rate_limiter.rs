@@ -42,23 +42,60 @@ impl RateLimiter {
 
     /// Extract subnet from IP address (/24 for IPv4, /64 for IPv6)
     fn extract_subnet(ip: &str) -> String {
-        if ip.contains(':') {
-            // IPv6 - use first 64 bits (first 4 groups)
-            ip.split(':').take(4).collect::<Vec<_>>().join(":")
-        } else {
+        // Try to parse as IPv6 first
+        if let Ok(ipv6) = ip.parse::<std::net::Ipv6Addr>() {
+            // IPv6 - use first 64 bits (first 4 segments)
+            let segments = ipv6.segments();
+            format!("{:x}:{:x}:{:x}:{:x}::", segments[0], segments[1], segments[2], segments[3])
+        } else if let Ok(ipv4) = ip.parse::<std::net::Ipv4Addr>() {
             // IPv4 - use /24 (first 3 octets)
-            ip.rsplitn(2, '.').nth(1).unwrap_or(ip).to_string() + ".0"
+            let octets = ipv4.octets();
+            format!("{}.{}.{}.0", octets[0], octets[1], octets[2])
+        } else {
+            // Invalid IP format - return as-is (will be treated as unique)
+            ip.to_string()
         }
     }
 
     /// Check if a claim is allowed for the given IP and address
     /// Returns (allowed, reason) where reason is None if allowed
     pub fn try_claim(&self, ip: &str, address: &str) -> (bool, Option<&'static str>) {
-        let mut ip_claims = self.ip_claims.lock().unwrap();
-        let mut address_claims = self.address_claims.lock().unwrap();
-        let mut lifetime_claims = self.address_lifetime_claims.lock().unwrap();
-        let mut subnet_claims = self.subnet_claims.lock().unwrap();
-        let mut ip_rotations = self.address_ip_rotations.lock().unwrap();
+        // Handle mutex poisoning gracefully - if poisoned, allow the request but log error
+        let mut ip_claims = match self.ip_claims.lock() {
+            Ok(guard) => guard,
+            Err(e) => {
+                tracing::error!("Mutex poisoned in ip_claims: {}", e);
+                return (false, Some("Internal error"));
+            }
+        };
+        let mut address_claims = match self.address_claims.lock() {
+            Ok(guard) => guard,
+            Err(e) => {
+                tracing::error!("Mutex poisoned in address_claims: {}", e);
+                return (false, Some("Internal error"));
+            }
+        };
+        let mut lifetime_claims = match self.address_lifetime_claims.lock() {
+            Ok(guard) => guard,
+            Err(e) => {
+                tracing::error!("Mutex poisoned in lifetime_claims: {}", e);
+                return (false, Some("Internal error"));
+            }
+        };
+        let mut subnet_claims = match self.subnet_claims.lock() {
+            Ok(guard) => guard,
+            Err(e) => {
+                tracing::error!("Mutex poisoned in subnet_claims: {}", e);
+                return (false, Some("Internal error"));
+            }
+        };
+        let mut ip_rotations = match self.address_ip_rotations.lock() {
+            Ok(guard) => guard,
+            Err(e) => {
+                tracing::error!("Mutex poisoned in ip_rotations: {}", e);
+                return (false, Some("Internal error"));
+            }
+        };
 
         // Cleanup old entries periodically
         if ip_claims.len() > 1000 {

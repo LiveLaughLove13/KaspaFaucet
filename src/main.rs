@@ -192,14 +192,20 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn status_handler(State(state): State<AppState>) -> Result<Json<StatusResponse>, StatusCode> {
-    let balance = state
-        .client
-        .get_balance_by_address(state.faucet_address.clone())
-        .await
-        .map_err(|e| {
-            error!("Failed to get balance: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    // Add timeout to prevent hanging on slow node
+    let balance = tokio::time::timeout(
+        Duration::from_secs(10),
+        state.client.get_balance_by_address(state.faucet_address.clone())
+    )
+    .await
+    .map_err(|_| {
+        error!("Timeout getting balance");
+        StatusCode::GATEWAY_TIMEOUT
+    })?
+    .map_err(|e| {
+        error!("Failed to get balance: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     Ok(Json(StatusResponse {
         active: true,
@@ -228,7 +234,7 @@ async fn claim_handler(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    // Trim and normalize address
+    // Trim and normalize address (consistent normalization everywhere)
     let address_str = payload.address.trim();
     if address_str.is_empty() {
         warn!("Empty address provided");
@@ -249,55 +255,68 @@ async fn claim_handler(
         StatusCode::BAD_REQUEST
     })?;
 
-    // Check for duplicate transaction (same IP + address combination)
-    {
-        let mut recent_txs = state.recent_transactions.lock().unwrap();
-        // Cleanup old entries
-        let now = Instant::now();
-        recent_txs.retain(|_, instant| now.duration_since(*instant) < TX_DEDUP_WINDOW);
+    // Normalize address consistently (same as rate limiter uses)
+    // Use lowercase and trim to ensure consistent comparison
+    let normalized_address = address_str.to_lowercase().trim().to_string();
 
-        let key = format!("{}:{}", ip, address_str);
-        if recent_txs.contains_key(&key) {
-            warn!(
-                "Duplicate transaction attempt detected: IP={}, address={}",
-                ip, address_str
-            );
-            return Err(StatusCode::TOO_MANY_REQUESTS);
-        }
-        recent_txs.insert(key, now);
-    }
-
-    // Check if address has received funds before (prevent new address spam)
-    // This helps prevent abuse where users generate many new addresses
-    let address_balance = state
-        .client
-        .get_balance_by_address(destination.clone())
-        .await
-        .map_err(|e| {
-            warn!("Failed to check address balance: {}", e);
-            // Don't fail the request if we can't check balance, but log it
-        })
-        .unwrap_or(0);
-
-    // Rate limit check (enhanced with multiple layers of protection)
-    let (allowed, reason) = state.rate_limiter.try_claim(&ip, address_str);
+    // SECURITY: Rate limit check FIRST (before expensive network calls)
+    // This prevents DoS via concurrent requests exhausting resources
+    let (allowed, reason) = state.rate_limiter.try_claim(&ip, &normalized_address);
     if !allowed {
         warn!(
             "Rate limit exceeded for IP: {}, address: {} - Reason: {}",
             ip,
-            address_str,
+            normalized_address,
             reason.unwrap_or("unknown")
         );
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 
+    // Check for duplicate transaction (same IP + address combination)
+    // Use normalized address for consistency
+    {
+        let mut recent_txs = state.recent_transactions.lock().map_err(|e| {
+            error!("Mutex poisoned in recent_transactions: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        // Cleanup old entries
+        let now = Instant::now();
+        recent_txs.retain(|_, instant| now.duration_since(*instant) < TX_DEDUP_WINDOW);
+
+        let key = format!("{}:{}", ip, normalized_address);
+        // Use insert to atomically check and set (prevents race condition)
+        if recent_txs.insert(key.clone(), now).is_some() {
+            warn!(
+                "Duplicate transaction attempt detected: IP={}, address={}",
+                ip, normalized_address
+            );
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
+    }
+
+    // Check if address has received funds before (prevent new address spam)
+    // This helps prevent abuse where users generate many new addresses
+    // Add timeout to prevent hanging on slow node
+    let address_balance = tokio::time::timeout(
+        Duration::from_secs(10),
+        state.client.get_balance_by_address(destination.clone())
+    )
+    .await
+    .map_err(|_| {
+        warn!("Timeout checking address balance");
+    })
+    .and_then(|result| result.map_err(|e| {
+        warn!("Failed to check address balance: {}", e);
+    }))
+    .unwrap_or(0);
+
     // Log address history for monitoring (new addresses vs existing ones)
     if address_balance == 0 {
-        info!("New address claim: {} (no previous balance)", address_str);
+        info!("New address claim: {} (no previous balance)", normalized_address);
     } else {
         info!(
             "Existing address claim: {} (balance: {} sompi)",
-            address_str, address_balance
+            normalized_address, address_balance
         );
     }
 
@@ -322,30 +341,36 @@ async fn claim_handler(
 }
 
 /// Extract the real IP address from the request, handling proxies
+/// WARNING: X-Forwarded-For can be spoofed. Only trust if behind a trusted reverse proxy.
 fn extract_real_ip(addr: &SocketAddr, headers: &HeaderMap) -> String {
     // Check X-Forwarded-For header (use first IP if multiple)
+    // SECURITY NOTE: This header can be spoofed by clients. Only use if behind trusted proxy.
+    // In production, validate that the request comes from a trusted proxy IP.
     if let Some(forwarded) = headers.get("x-forwarded-for") {
         if let Ok(forwarded_str) = forwarded.to_str() {
             // X-Forwarded-For can contain multiple IPs: "client, proxy1, proxy2"
             // We take the first one (the original client)
             if let Some(first_ip) = forwarded_str.split(',').next() {
                 let ip_str = first_ip.trim();
-                // Basic validation: check if it looks like an IP
-                if ip_str.contains(':') || ip_str.matches('.').count() == 3 {
+                // Validate IP format properly
+                if ip_str.parse::<std::net::IpAddr>().is_ok() {
                     return ip_str.to_string();
                 }
             }
         }
     }
 
-    // Check X-Real-IP header
+    // Check X-Real-IP header (more trustworthy, usually set by reverse proxy)
     if let Some(real_ip) = headers.get("x-real-ip") {
         if let Ok(ip_str) = real_ip.to_str() {
-            return ip_str.trim().to_string();
+            let trimmed = ip_str.trim();
+            if trimmed.parse::<std::net::IpAddr>().is_ok() {
+                return trimmed.to_string();
+            }
         }
     }
 
-    // Fall back to direct connection IP
+    // Fall back to direct connection IP (most trustworthy)
     addr.ip().to_string()
 }
 
