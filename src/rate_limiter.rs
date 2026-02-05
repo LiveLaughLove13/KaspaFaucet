@@ -46,7 +46,10 @@ impl RateLimiter {
         if let Ok(ipv6) = ip.parse::<std::net::Ipv6Addr>() {
             // IPv6 - use first 64 bits (first 4 segments)
             let segments = ipv6.segments();
-            format!("{:x}:{:x}:{:x}:{:x}::", segments[0], segments[1], segments[2], segments[3])
+            format!(
+                "{:x}:{:x}:{:x}:{:x}::",
+                segments[0], segments[1], segments[2], segments[3]
+            )
         } else if let Ok(ipv4) = ip.parse::<std::net::Ipv4Addr>() {
             // IPv4 - use /24 (first 3 octets)
             let octets = ipv4.octets();

@@ -195,7 +195,9 @@ async fn status_handler(State(state): State<AppState>) -> Result<Json<StatusResp
     // Add timeout to prevent hanging on slow node
     let balance = tokio::time::timeout(
         Duration::from_secs(10),
-        state.client.get_balance_by_address(state.faucet_address.clone())
+        state
+            .client
+            .get_balance_by_address(state.faucet_address.clone()),
     )
     .await
     .map_err(|_| {
@@ -299,20 +301,25 @@ async fn claim_handler(
     // Add timeout to prevent hanging on slow node
     let address_balance = tokio::time::timeout(
         Duration::from_secs(10),
-        state.client.get_balance_by_address(destination.clone())
+        state.client.get_balance_by_address(destination.clone()),
     )
     .await
     .map_err(|_| {
         warn!("Timeout checking address balance");
     })
-    .and_then(|result| result.map_err(|e| {
-        warn!("Failed to check address balance: {}", e);
-    }))
+    .and_then(|result| {
+        result.map_err(|e| {
+            warn!("Failed to check address balance: {}", e);
+        })
+    })
     .unwrap_or(0);
 
     // Log address history for monitoring (new addresses vs existing ones)
     if address_balance == 0 {
-        info!("New address claim: {} (no previous balance)", normalized_address);
+        info!(
+            "New address claim: {} (no previous balance)",
+            normalized_address
+        );
     } else {
         info!(
             "Existing address claim: {} (balance: {} sompi)",
